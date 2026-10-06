@@ -1,0 +1,228 @@
+name: Migrate private corpus PDFs to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Target release tag in private corpus repository
+        required: false
+        default: corpus-assets-2026-10-06
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ secrets.CORPUS_TOKEN }}
+      TARGET_REPO: z13321812367-sys/classical_diffusion_corpus
+      RELEASE_TAG: ${{ inputs.release_tag }}
+
+    steps:
+      - name: Checkout private corpus snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: z13321812367-sys/classical_diffusion_corpus
+          token: ${{ secrets.CORPUS_TOKEN }}
+          ref: main
+          fetch-depth: 1
+          path: corpus
+
+      - name: Resolve release and existing assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            head_sha="$(git -C corpus rev-parse HEAD)"
+            gh release create "$RELEASE_TAG" \
+              --repo "$TARGET_REPO" \
+              --target "$head_sha" \
+              --title "Classical diffusion corpus assets — 2026-10-06" \
+              --notes "Binary corpus migration from Git blobs to GitHub Release assets. Original repository PDFs are retained until verification completes."
+          fi
+          rid="$(gh api "repos/$TARGET_REPO/releases/tags/$RELEASE_TAG" --jq .id)"
+          echo "RELEASE_ID=$rid" >> "$GITHUB_ENV"
+          gh api --method GET --paginate --slurp \
+            "repos/$TARGET_REPO/releases/$rid/assets?per_page=100" \
+            > existing_assets_pages.json
+
+      - name: Build manifest and stage missing assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, subprocess
+
+          repo = os.environ["TARGET_REPO"]
+          tag = os.environ["RELEASE_TAG"]
+          head = subprocess.check_output(
+              ["git", "-C", "corpus", "rev-parse", "HEAD"], text=True
+          ).strip()
+
+          pages = json.loads(Path("existing_assets_pages.json").read_text(encoding="utf-8"))
+          existing = {}
+          for page in pages:
+              for a in page:
+                  existing[a["name"]] = int(a.get("size", 0))
+
+          raw = subprocess.check_output(
+              ["git", "-C", "corpus", "ls-files", "-z", "--", "*.pdf"]
+          )
+          paths = [p.decode("utf-8") for p in raw.split(b"\0") if p]
+
+          stage = Path("stage")
+          stage.mkdir(exist_ok=True)
+          rows = []
+          upload = []
+
+          for rel in paths:
+              src = Path("corpus") / rel
+              size = src.stat().st_size
+              blob = subprocess.check_output(
+                  ["git", "-C", "corpus", "rev-parse", f"HEAD:{rel}"], text=True
+              ).strip()
+              sha256 = hashlib.sha256()
+              with src.open("rb") as f:
+                  for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                      sha256.update(chunk)
+
+              asset = f"{blob}.pdf"
+              rows.append({
+                  "source_repository": repo,
+                  "source_commit": head,
+                  "source_path": rel,
+                  "git_blob_sha": blob,
+                  "sha256": sha256.hexdigest(),
+                  "file_size_bytes": size,
+                  "release_tag": tag,
+                  "asset_name": asset,
+                  "release_url": f"https://github.com/{repo}/releases/download/{tag}/{asset}",
+              })
+
+              if existing.get(asset) != size:
+                  target = stage / asset
+                  try:
+                      os.link(src, target)
+                  except OSError:
+                      import shutil
+                      shutil.copy2(src, target)
+                  upload.append((size, str(target)))
+
+          rows.sort(key=lambda x: x["source_path"])
+          upload.sort(reverse=True)
+
+          manifest = {
+              "schema": "ClassicalDiffusionReleaseManifest.v1",
+              "source_repository": repo,
+              "source_commit": head,
+              "release_tag": tag,
+              "pdf_count": len(rows),
+              "unique_pdf_blob_count": len({x["git_blob_sha"] for x in rows}),
+              "total_pdf_bytes": sum(x["file_size_bytes"] for x in rows),
+              "assets": rows,
+          }
+          Path("release_manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          Path("upload_list.txt").write_text(
+              "".join(path + "\n" for _, path in upload),
+              encoding="utf-8",
+          )
+          print(
+              f"snapshot={head} pdfs={manifest['pdf_count']} "
+              f"bytes={manifest['total_pdf_bytes']} "
+              f"already_ok={len(rows)-len(upload)} missing_or_bad={len(upload)}"
+          )
+          PY
+
+      - name: Upload missing PDF assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          upload_one() {
+            local f="$1"
+            local attempt
+            for attempt in 1 2 3 4; do
+              if gh release upload "$RELEASE_TAG" "$f" \
+                --repo "$TARGET_REPO" --clobber >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep $((attempt * 5))
+            done
+            echo "asset upload failed after retries: $(basename "$f")" >&2
+            return 1
+          }
+          export -f upload_one
+          export GH_TOKEN RELEASE_TAG TARGET_REPO
+
+          if [ -s upload_list.txt ]; then
+            xargs -r -n 1 -P 6 bash -c 'upload_one "$1"' _ < upload_list.txt
+          fi
+
+      - name: Verify every PDF asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method GET --paginate --slurp \
+            "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
+            > final_assets_pages.json
+
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          manifest = json.loads(Path("release_manifest.json").read_text(encoding="utf-8"))
+          pages = json.loads(Path("final_assets_pages.json").read_text(encoding="utf-8"))
+          actual = {}
+          states = {}
+          for page in pages:
+              for a in page:
+                  actual[a["name"]] = int(a.get("size", 0))
+                  states[a["name"]] = a.get("state")
+
+          expected = {x["asset_name"]: int(x["file_size_bytes"]) for x in manifest["assets"]}
+          missing = sorted(set(expected) - set(actual))
+          bad_size = sorted(
+              name for name, size in expected.items()
+              if name in actual and actual[name] != size
+          )
+          bad_state = sorted(
+              name for name in expected
+              if name in states and states[name] != "uploaded"
+          )
+          extra_pdf = sorted(
+              name for name in actual
+              if name.endswith(".pdf") and name not in expected
+          )
+
+          if missing or bad_size or bad_state or extra_pdf:
+              raise SystemExit(
+                  f"verification failed: missing={len(missing)} "
+                  f"bad_size={len(bad_size)} bad_state={len(bad_state)} "
+                  f"extra_pdf={len(extra_pdf)}"
+              )
+
+          actual_bytes = sum(actual[name] for name in expected)
+          if len(expected) != manifest["pdf_count"]:
+              raise SystemExit("manifest pdf count mismatch")
+          if actual_bytes != manifest["total_pdf_bytes"]:
+              raise SystemExit(
+                  f"byte mismatch {actual_bytes} != {manifest['total_pdf_bytes']}"
+              )
+
+          print(
+              f"VERIFIED pdfs={len(expected)} bytes={actual_bytes} "
+              f"source_commit={manifest['source_commit']}"
+          )
+          PY
+
+      - name: Upload verified release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" release_manifest.json \
+            --repo "$TARGET_REPO" --clobber
